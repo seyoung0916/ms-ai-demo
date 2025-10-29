@@ -87,7 +87,12 @@ Pressm AI는 언론홍보 업무를 도와주는 **AI 홍보 비서 시스템**
 
 ## 📌 사용 기술
 
-- **Azure OpenAI** – 글 생성, 요약, 감성 분석
+- 프론트/데모: Streamlit (보도자료 생성/스크랩/요약·감성)
+- 모델: Azure OpenAI (Chat Completions)
+- 뉴스 수집: Bing News Search API (또는 Azure AI Foundry의 Bing Grounding 리소스)
+- 발송: 이메일(Azure Communication Services Email) / MMS(트윌리오)
+- 파일 저장: Azure Storage(Blob) – 날짜별 PDF 저장
+- 보안/운영: Key Vault(비밀), App Insights(로그), 비용·속도 최적화
 
 ---
 
@@ -98,3 +103,13 @@ Pressm AI는 언론홍보 업무를 도와주는 **AI 홍보 비서 시스템**
 - 실시간 여론을 모니터링하는 알림 서비스
 
 ---
+
+## 프로젝트 뼈대 만들기
+
+```python
+
+# 가상 환경 생성 및 실행
+python -m venv .venv && source .venv/bin/activate
+pip install openai azure-identity azure-communication-email requests python-dotenv streamlit reportlab
+
+```
