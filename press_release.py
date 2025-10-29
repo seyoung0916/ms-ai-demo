@@ -17,7 +17,7 @@ def draft_press_release(keywords: str, tone: str = "사회"):
         "한국 언론 보도자료 포맷을 따르고, 사실/수치/인용은 [플레이스홀더]로 표기."
     )
     user = f"키워드: {keywords}\n매체 톤: {tone}\n출력: 제목/부제/본문"
-    resp = client.chat.completions.create(
+    resp = client.chat.compgiletions.create(
         model=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
         messages=[
             {"role": "system", "content": system},
