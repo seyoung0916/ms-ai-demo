@@ -12,7 +12,8 @@ client = AzureOpenAI(
 
 
 def _truncate(text: str, max_chars: int = 12000) -> str:
-    # 토큰 관리용 잘라내기 (MVP)
+    # 긴 문서에 대한 토큰 초과 가능성 방지
+    # 토큰 관리용 잘라내기
     if not text:
         return ""
     return text[:max_chars]
