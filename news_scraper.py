@@ -3,10 +3,18 @@ import os, json, time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+# --- 날짜/타임존 유틸 ---
+from datetime import datetime, timedelta, timezone
+import calendar
+import re
+
 from dotenv import load_dotenv
 from azure.identity import DefaultAzureCredential
 from azure.ai.projects import AIProjectClient
 from azure.ai.agents.models import BingGroundingTool
+
+from urllib.parse import urlparse
+import collections
 
 
 # =========================
@@ -20,6 +28,9 @@ PROJECT_ENDPOINT = (os.getenv("AZURE_AI_PROJECT_ENDPOINT") or "").strip()
 MODEL_DEPLOYMENT = (os.getenv("MODEL_DEPLOYMENT") or "").strip()
 BING_CONN_NAME = (os.getenv("BING_CONNECTION_NAME") or "").strip()
 DEBUG = (os.getenv("DEBUG") or "0").strip() in ("1", "true", "True")
+
+KST = timezone(timedelta(hours=9))
+_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
 class NewsError(Exception):
@@ -51,6 +62,14 @@ def _project() -> AIProjectClient:
         )
         _log(f"AIProjectClient initialized: endpoint={PROJECT_ENDPOINT}")
     return _project_client
+
+
+def _domain(u: str) -> str:
+    try:
+        netloc = urlparse(u or "").netloc.lower()
+        return netloc.replace("www.", "")
+    except Exception:
+        return ""
 
 
 def _get_bing_tool_definitions():
@@ -149,6 +168,172 @@ def _ensure_agent() -> dict:
     return _agent_cache
 
 
+def _parse_dt_utc(dt_str: str) -> Optional[datetime]:
+    """published 문자열을 최대한 파싱해 UTC timezone-aware datetime 반환. 실패 시 None."""
+    if not dt_str:
+        return None
+    s = dt_str.strip()
+    # ISO-8601 (Z 또는 +offset)
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except Exception:
+        pass
+    # yyyy-mm-dd 또는 yyyy-mm-ddTHH:MM:SS (timezone 없음) → UTC 가정
+    try:
+        if _ISO_RE.match(s):
+            # 길이에 따라 포맷 선택
+            if "T" in s:
+                return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S").replace(
+                    tzinfo=timezone.utc
+                )
+            else:
+                return datetime.strptime(s[:10], "%Y-%m-%d").replace(
+                    tzinfo=timezone.utc
+                )
+    except Exception:
+        pass
+    return None
+
+
+def _kst_calendar_window(freshness: str) -> tuple[datetime, datetime]:
+    """
+    Day: 오늘 00:00 ~ 오늘 23:59:59 (KST)
+    Week: 이번 주 월요일 00:00 ~ 일요일 23:59:59 (KST)
+    Month: 이번 달 1일 00:00 ~ 말일 23:59:59 (KST)
+    반환은 비교 편의를 위해 모두 UTC 로 변환.
+    """
+    now_kst = datetime.now(KST)
+    if freshness.lower() == "day":
+        start_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_kst = start_kst + timedelta(days=1) - timedelta(seconds=1)
+    elif freshness.lower() == "week":
+        # 월요일 = 0
+        weekday = now_kst.weekday()
+        start_kst = (now_kst - timedelta(days=weekday)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        end_kst = start_kst + timedelta(days=7) - timedelta(seconds=1)
+    else:  # "month" or 기타 → 이번 달
+        year = now_kst.year
+        month = now_kst.month
+        start_kst = datetime(year, month, 1, 0, 0, 0, tzinfo=KST)
+        last_day = calendar.monthrange(year, month)[1]
+        end_kst = datetime(year, month, last_day, 23, 59, 59, tzinfo=KST)
+    # UTC로 변환
+    return (start_kst.astimezone(timezone.utc), end_kst.astimezone(timezone.utc))
+
+
+# ------------ 멀티패스 확장 검색 ------------
+
+
+def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """URL(정규화) -> title(소문자) 순으로 중복 제거."""
+    seen = set()
+    out = []
+
+    def _norm_url(u: str) -> str:
+        try:
+            from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
+
+            p = urlparse(u or "")
+            # utm_* 등 추적 파라미터 제거
+            qs = parse_qs(p.query)
+            qs = {k: v for k, v in qs.items() if not k.lower().startswith("utm")}
+            new = p._replace(query=urlencode(qs, doseq=True))
+            return urlunparse(new)
+        except Exception:
+            return (u or "").strip()
+
+    for it in items:
+        key = _norm_url(it.get("url", "")) or (it.get("title", "").strip().lower())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
+
+def _has_site_filter(q: str) -> bool:
+    return "site:" in (q or "").lower()
+
+
+def _remove_site_filters(q: str) -> str:
+    """site: 도메인 조건을 걷어내 원문 쿼리만 남김."""
+    if not q:
+        return q
+    import re
+
+    # 대충 (site:xxx OR site:yyy) 같은 구간 제거
+    q2 = re.sub(r"\(\s*site:[^)]+\)", "", q, flags=re.IGNORECASE)
+    q2 = re.sub(r"site:\S+", "", q2, flags=re.IGNORECASE)
+    q2 = re.sub(r"\s{2,}", " ", q2).strip()
+    return q2
+
+
+def _simplify_query(q: str) -> str:
+    """따옴표/과한 OR/AND를 정리해 검색 폭을 넓힌 변형."""
+    if not q:
+        return q
+    q2 = q.replace("AND", " ").replace("OR", " ")
+    q2 = q2.replace("  ", " ").replace('"', "").strip()
+    return q2
+
+
+def search_news_multi(
+    q: str,
+    count: int = 30,
+    freshness: str = "Week",
+    market: str = "ko-KR",
+    target_results: int = 20,
+    max_rounds: int = 3,
+) -> List[Dict[str, Any]]:
+    """
+    멀티패스: 변형 쿼리로 여러 번 호출해 합치는 확장 검색.
+    - 1라운드: 원본 쿼리
+    - 2라운드: site: 필터가 있으면 제거
+    - 3라운드: 질의 단순화(따옴표/OR 제거)
+    """
+    rounds: List[str] = [q]
+
+    if _has_site_filter(q):
+        rounds.append(_remove_site_filters(q))
+    rounds.append(_simplify_query(q))
+
+    # 중복 라운드 제거
+    uniq_rounds = []
+    seen_q = set()
+    for rq in rounds:
+        rq = (rq or "").strip()
+        if rq and rq not in seen_q:
+            uniq_rounds.append(rq)
+            seen_q.add(rq)
+
+    all_items: List[Dict[str, Any]] = []
+    need = max(target_results, min(count, 50))  # 목표 개수
+    per_round = min(need, 20)  # 라운드당 요청 수 (너무 크게하면 품질 저하)
+
+    for i, rq in enumerate(uniq_rounds[:max_rounds], start=1):
+        try:
+            _log(f"[multi] round {i}/{max_rounds} q='{rq}'")
+            got = search_news(rq, count=per_round, freshness=freshness, market=market)
+            all_items.extend(got)
+            all_items = _dedupe(all_items)
+            _log(f"[multi] 누적 {len(all_items)}건 (이번 라운드 {len(got)}건)")
+            if len(all_items) >= need:
+                break
+        except Exception as e:
+            _log(f"[multi] round {i} 실패: {e}")
+
+    # 필요하면 정렬(기존 search_news 내부에서도 정렬하지만, 합쳐졌으니 안전하게 한 번 더)
+    def _key_dt(it):
+        d = _parse_dt_utc(it.get("published"))
+        return (0, d) if d else (1, datetime.fromtimestamp(0, tz=timezone.utc))
+
+    all_items.sort(key=_key_dt, reverse=True)
+
+    return all_items[:need]
+
+
 def _run_and_wait(agent_id: str, prompt: str, timeout_sec: int = 180) -> str:
     """
     Run 생성 후 상태를 폴링해 최종 응답을 받는다.
@@ -184,7 +369,7 @@ def _run_and_wait(agent_id: str, prompt: str, timeout_sec: int = 180) -> str:
 
         time.sleep(0.7)
 
-    # ⬇⬇⬇ 메시지 추출은 while 바깥에서!
+    # 마지막 assistant 메시지에서 응답 추출
     try:
         msg = client.agents.messages.get_last_message_by_role(
             thread_id=thread["id"], role="assistant"
@@ -327,14 +512,65 @@ def search_news(
         raise NewsError(f"JSON 파싱 실패: {e}\n응답 미리보기: {preview}")
 
     items: List[Dict[str, Any]] = []
+
     for v in data:
         items.append(
             {
                 "title": (v.get("title") or "").strip(),
                 "snippet": (v.get("snippet") or "").strip(),
                 "source": (v.get("source") or "").strip(),
-                "published": (v.get("published") or "").strip(),
+                "published": (v.get("published") or "").strip(),  # ISO 권장
                 "url": (v.get("url") or "").strip(),
             }
         )
-    return items
+
+    # --- KST 캘린더 윈도우 계산 ---
+    win_start_utc, win_end_utc = _kst_calendar_window(freshness)
+
+    kept: List[Dict[str, Any]] = []
+    dropped_due_to_window: List[Dict[str, Any]] = []
+    unparsable: List[Dict[str, Any]] = []
+
+    for it in items:
+        dt_utc = _parse_dt_utc(it.get("published"))
+        if dt_utc is None:
+            # ⬅️ published를 못 읽어도 포함 (Bing freshness를 신뢰)
+            unparsable.append(it)
+            kept.append(it)
+            continue
+
+        if win_start_utc <= dt_utc <= win_end_utc:
+            kept.append(it)
+        else:
+            dropped_due_to_window.append(it)
+
+    # 결과가 0이면 롤링 윈도우 백업 (Day=24h, Week=7d, Month=30d)
+    if not kept:
+        from datetime import timezone, datetime, timedelta
+
+        now_utc = datetime.now(timezone.utc)
+        days = (
+            30
+            if freshness.lower() == "month"
+            else (7 if freshness.lower() == "week" else 1)
+        )
+        for it in items:
+            dt_utc = _parse_dt_utc(it.get("published"))
+            if dt_utc is None:
+                kept.append(it)
+            elif (now_utc - dt_utc) <= timedelta(days=days):
+                kept.append(it)
+
+    # 최신순 정렬: 날짜 없는 건 제일 뒤로
+    def _sort_key(it):
+        d = _parse_dt_utc(it.get("published"))
+        return (0, d) if d else (1, datetime.fromtimestamp(0, tz=timezone.utc))
+
+    kept.sort(key=_sort_key, reverse=True)
+
+    # 디버그 힌트
+    _log(
+        f"검색 원본 {len(items)}건 → 보존 {len(kept)}건 / 탈락 {len(dropped_due_to_window)}건 / 날짜미상 {len(unparsable)}건"
+    )
+
+    return kept
