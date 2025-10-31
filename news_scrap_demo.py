@@ -14,6 +14,7 @@ from storage_utils import (
     generate_docx_bytes,
     make_docx_filename_from_query,
     upload_docx,
+    upload_docx_report,
 )
 
 
@@ -48,7 +49,7 @@ def render_news_scrap_demo():
     # ── 검색 폼 (리런에도 상태 유지) ───────────────────────────────
     with st.form("search_form", clear_on_submit=False):
         st.caption("검색 옵션")
-        q = st.text_area("키워드 / 질의", "KT", height=90)
+        q = st.text_area("키워드 / 질의", "AI", height=90)
         freshness = st.selectbox("기간(freshness)", ["Day", "Week", "Month"], index=2)
         count = st.slider("개수", 3, 30, 10, step=1)
         market = st.selectbox("시장/언어(market)", ["ko-KR", "en-US", "ja-JP"], index=0)
@@ -223,16 +224,17 @@ def render_news_scrap_demo():
                     if not path.lower().endswith(".docx"):
                         path += ".docx"
 
-                    container, blob = upload_docx(docx_bytes, path)
-                    link = sas_url(container, blob, minutes=120) or public_blob_url(
-                        container, blob
-                    )
+                    # container, blob = upload_docx(docx_bytes, path)
+                    container, blob_path, link = upload_docx_report(items, query=q)
+                    # link = sas_url(container, blob, minutes=120) or public_blob_url(
+                    #     container, blob
+                    # )
 
-                    st.session_state["docx_blob_info"] = {
-                        "container": container,
-                        "blob": blob,
-                        "link": link,
-                    }
+                    # st.session_state["docx_blob_info"] = {
+                    #     "container": container,
+                    #     "blob": blob,
+                    #     "link": link,
+                    # }
                 st.success("DOCX 업로드 완료! 아래 링크로 열거나 다운로드할 수 있어요.")
                 st.rerun()  # 업로드 후 즉시 재렌더링하여 링크/버튼 노출
             except Exception as e:

@@ -1,8 +1,11 @@
+# storage_utils.py
 from __future__ import annotations
 
-
-import os, json, io, datetime, traceback
+import os, json, io, traceback, re
+from io import BytesIO
 from typing import Optional, Tuple, List
+from datetime import datetime, timedelta, timezone
+
 from azure.storage.blob import (
     BlobServiceClient,
     generate_blob_sas,
@@ -15,6 +18,7 @@ from azure.core.exceptions import (
     ClientAuthenticationError,
 )
 
+# PDF 관련 (옵션: 지금은 DOCX 저장이 메인)
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -27,11 +31,9 @@ try:
     from docx.shared import Pt
     from docx.oxml.ns import qn
 except Exception:
-    # python-docx may not be installed; functions that use it should handle ImportError at runtime
     Document = None
     Pt = None
     qn = None
-import re
 
 # ── ENV ─────────────────────────────────────────────────────────
 CONN_STR = (os.getenv("AZURE_STORAGE_CONNECTION_STRING") or "").strip()
@@ -68,11 +70,8 @@ def _svc() -> BlobServiceClient:
     return _client
 
 
+# ── 폰트 헬퍼 (PDF용 — 지금은 DOCX가 메인) ─────────────────────────
 def _download_noto_font(font_dir: str = "./fonts") -> Optional[str]:
-    """
-    NotoSansKR-Regular.otf 폰트를 자동 다운로드하여 경로 반환
-    """
-    # Use the googlefonts 'noto-cjk' raw file URL (raw content) to download the OTF file
     font_url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/KR/NotoSansKR-Regular.otf"
     os.makedirs(font_dir, exist_ok=True)
     font_path = os.path.join(font_dir, "NotoSansKR-Regular.otf")
@@ -91,21 +90,12 @@ def _download_noto_font(font_dir: str = "./fonts") -> Optional[str]:
 
 
 def _find_korean_font_path() -> Optional[str]:
-    """
-    한글 폰트 경로 탐색:
-      1) .env: KOREAN_FONT_PATH 지정 시 우선
-      2) macOS/Windows/리눅스에서 흔한 경로 추정
-      3) 없으면 None (Helvetica 사용) → 일부 한글이 깨질 수 있음
-    """
     env_path = (os.getenv("KOREAN_FONT_PATH") or "").strip()
     if env_path and os.path.exists(env_path):
         return env_path
-
-    # 자동 다운로드 시도
     noto_font = _download_noto_font()
     if noto_font and os.path.exists(noto_font):
         return noto_font
-
     candidates = [
         "/System/Library/Fonts/AppleSDGothicNeo.ttc",
         "/Library/Fonts/Apple SD Gothic Neo.ttf",
@@ -125,9 +115,6 @@ def _find_korean_font_path() -> Optional[str]:
 
 
 def _register_korean_font(font_name: str = "KFONT") -> Optional[str]:
-    """
-    ReportLab에 한글 폰트 등록. 성공 시 font_name 반환, 실패 시 None.
-    """
     try:
         fp = _find_korean_font_path()
         if not fp:
@@ -138,6 +125,7 @@ def _register_korean_font(font_name: str = "KFONT") -> Optional[str]:
         return None
 
 
+# ── PDF 생성 (옵션) ─────────────────────────────────────────────
 def generate_pdf_bytes(
     items: List[dict],
     *,
@@ -147,11 +135,6 @@ def generate_pdf_bytes(
     market: str,
     generated_at: Optional[str] = None,
 ) -> bytes:
-    """
-    뉴스 항목을 간단한 표/문단으로 PDF 렌더링하여 바이트 반환.
-    - 한글 폰트가 없으면 Helvetica로 진행(일부 글자 깨질 수 있음)
-    - 폰트 파일이 있으면 .env KOREAN_FONT_PATH에 지정 권장
-    """
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36
@@ -160,12 +143,7 @@ def generate_pdf_bytes(
     font_name = _register_korean_font() or "Helvetica"
     styles = getSampleStyleSheet()
 
-    base = {
-        "fontName": font_name,
-        "fontSize": 11,
-        "leading": 16,
-    }
-    # base에서 중복 키 제거 후 전달
+    base = {"fontName": font_name, "fontSize": 11, "leading": 16}
     base_title = {
         k: v for k, v in base.items() if k not in ("fontSize", "leading", "spaceAfter")
     }
@@ -185,14 +163,12 @@ def generate_pdf_bytes(
     story.append(Paragraph(subtitle, style_sub))
     story.append(Spacer(1, 6))
 
-    # 표 데이터: 헤더 + 행들
     data = [["제목", "매체/시간", "링크"]]
     for it in items:
         title_p = Paragraph((it.get("title") or "").replace("\n", " "), style_cell)
         meta = f"{it.get('source') or '-'} / {it.get('published') or '-'}"
         meta_p = Paragraph(meta, style_cell)
         url = it.get("url") or "-"
-        # 링크는 그냥 텍스트로 (PDF 클릭링크까지 구현하려면 <link> 태그 사용 가능)
         url_p = Paragraph(url.replace(" ", ""), style_cell)
         data.append([title_p, meta_p, url_p])
 
@@ -217,28 +193,28 @@ def generate_pdf_bytes(
     )
     story.append(table)
 
-    # 폰트 경고 (옵션)
     if font_name == "Helvetica":
         story.append(Spacer(1, 6))
-        warn = "⚠️ 시스템에 한글 폰트가 없어 일부 문자가 깨질 수 있습니다. .env의 KOREAN_FONT_PATH에 한글 폰트 경로를 지정하세요."
+        warn = "⚠️ 한글 폰트가 없어 일부 문자가 깨질 수 있습니다. .env의 KOREAN_FONT_PATH에 한글 폰트 경로를 지정하세요."
         story.append(Paragraph(warn, style_sub))
 
     doc.build(story)
     return buf.getvalue()
 
 
-# ── DOCX 변환 ──────────────────────────────────────────────────
+# ── DOCX 생성 ──────────────────────────────────────────────────
 def generate_docx_bytes(
     items: List[dict],
     *,
-    title: str,
-    query: str,
-    freshness: str,
-    market: str,
+    title: str = "뉴스 스크랩 리포트",
+    query: str = "",
+    freshness: str = "",
+    market: str = "",
     generated_at: Optional[str] = None,
 ) -> bytes:
     """
-    뉴스 항목을 docx(워드) 파일로 변환하여 바이트 반환. 한글 깨짐 없음.
+    뉴스 항목을 docx(워드) 파일로 변환하여 바이트 반환. (한글 호환)
+    - 인자 대부분 선택형으로 만들어 기존/새 호출 모두 수용
     """
     if Document is None:
         raise RuntimeError(
@@ -246,7 +222,7 @@ def generate_docx_bytes(
         )
 
     doc = Document()
-    # 한글 스타일 지정 (맑은 고딕을 기본으로 시도)
+    # 한글 기본 폰트 시도
     try:
         style = doc.styles["Normal"]
         font = style.font
@@ -254,14 +230,17 @@ def generate_docx_bytes(
         font.size = Pt(11)
         style._element.rPr.rFonts.set(qn("w:eastAsia"), "맑은 고딕")
     except Exception:
-        # 일부 환경에서는 스타일 변경이 실패할 수 있으나 파일 자체는 생성됨
         pass
 
     doc.add_heading(title, level=0)
-    subtitle = f"Query: {query}  |  Freshness: {freshness}  |  Market: {market}"
+    subtitle = (
+        f"Query: {query}"
+        + (f"  |  Freshness: {freshness}" if freshness else "")
+        + (f"  |  Market: {market}" if market else "")
+    )
     if generated_at:
         subtitle += f"  |  Generated: {generated_at}"
-    doc.add_paragraph(subtitle)
+    doc.add_paragraph(subtitle.strip("  |"))
 
     table = doc.add_table(rows=1, cols=3)
     table.style = "Table Grid"
@@ -282,22 +261,23 @@ def generate_docx_bytes(
     return buf.getvalue()
 
 
+# ── 파일명 유틸 (옵션) ──────────────────────────────────────────
 def make_pdf_filename_from_query(query: str, include_date: bool = True) -> str:
-    """
-    검색조건(쿼리)로부터 파일명 생성.
-    - 'pdf/' 폴더 아래
-    - 하위 폴더 추가 생성 없음
-    - 한글/영문/숫자만 남기고 나머지는 '_' 치환
-    - 덮어쓰기 방지를 위해 기본은 날짜 접미사 붙임(원치 않으면 include_date=False)
-    """
-    q = (query or "").strip()
-    if not q:
-        q = "pressm"
+    q = (query or "").strip() or "pressm"
     slug = re.sub(r"[^0-9A-Za-z가-힣]+", "_", q).strip("_")
     if include_date:
-        today = datetime.datetime.now().strftime("%Y%m%d")
+        today = datetime.now().strftime("%Y%m%d")
         return f"pdf/{slug}_{today}.pdf"
     return f"pdf/{slug}.pdf"
+
+
+def make_docx_filename_from_query(query: str, include_date: bool = True) -> str:
+    q = (query or "").strip() or "pressm"
+    slug = re.sub(r"[^0-9A-Za-z가-힣]+", "_", q).strip("_")
+    if include_date:
+        today = datetime.now().strftime("%Y%m%d")
+        return f"docx/{slug}_{today}.docx"
+    return f"docx/{slug}.docx"
 
 
 # ── Container ───────────────────────────────────────────────────
@@ -316,14 +296,15 @@ def ensure_container():
         raise
 
 
+def blob_exists(container: str, blob_path: str) -> bool:
+    return _svc().get_blob_client(container, blob_path).exists()
+
+
 # ── Upload / Download ───────────────────────────────────────────
 def upload_json(obj, *, prefix: str = "news/json") -> Tuple[str, str]:
-    """
-    obj(JSON 직렬화)를 업로드. return (container, blob_path)
-    """
     ensure_container()
-    now = datetime.datetime.now().strftime("%Y-%m-%d")
-    ts = datetime.datetime.now().strftime("%H%M%S")
+    now = datetime.now().strftime("%Y-%m-%d")
+    ts = datetime.now().strftime("%H%M%S")
     blob_path = f"{prefix}/{now}/pressm_{ts}.json"
 
     data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
@@ -361,25 +342,15 @@ def public_blob_url(container: str, blob: str) -> str:
 
 
 def sas_url(container: str, blob: str, minutes: int = 120) -> Optional[str]:
-    """
-    키 방식에서 SAS 생성:
-      - Connection String 있으면 그 계정키로
-      - 아니면 Account Key로
-    """
-    from datetime import datetime, timedelta
-
     acct = ACCOUNT_NAME or (
         _svc().account_name if hasattr(_svc(), "account_name") else ""
     )
     if not acct:
         return None
-
-    # 계정 키 확보
     ak = ACCOUNT_KEY
     if not ak and CONN_STR:
-        # 연결문자열만 있고 ACCOUNT_KEY 환경변수는 비어있을 수 있음 → SAS 생성을 생략
+        # 연결문자열만 있고 ACCOUNT_KEY는 없는 경우 → SAS 생략(불가)
         return None
-
     if not ak:
         return None
 
@@ -394,30 +365,69 @@ def sas_url(container: str, blob: str, minutes: int = 120) -> Optional[str]:
     return f"https://{acct}.blob.core.windows.net/{container}/{blob}?{token}"
 
 
-def upload_pdf(pdf_bytes: bytes, blob_path: str) -> Tuple[str, str]:
+# ── 버전 파일명 유틸 ────────────────────────────────────────────
+def _next_version_name(container: str, base_path: str) -> str:
     """
-    이미 생성된 PDF 바이트를 지정한 blob_path에 업로드.
-    blob_path 예: 'pdf/KT_20251030.pdf'
+    base_path: 'news_pdf/2025-10-30.docx' 가 이미 있으면
+    'news_pdf/2025-10-30 (1).docx', '... (2).docx' ... 로 증가
+    """
+    if not blob_exists(container, base_path):
+        return base_path
+
+    if "." in base_path:
+        stem, ext = base_path.rsplit(".", 1)
+        ext = "." + ext
+    else:
+        stem, ext = base_path, ""
+
+    n = 1
+    while True:
+        candidate = f"{stem} ({n}){ext}"
+        if not blob_exists(container, candidate):
+            return candidate
+        n += 1
+
+
+# ── DOCX 업로드 (요구사항 핵심) ──────────────────────────────────
+def upload_docx_report(
+    items: List[dict], *, query: str = "", kst_date: datetime | None = None
+) -> tuple[str, str, str]:
+    """
+    DOCX 리포트를 news_pdf/YYYY-MM-DD.docx 로 업로드.
+    동일 날짜 파일이 있으면 (1), (2) 등 버전 부여.
+    return: (container, blob_path, sas_link)
     """
     ensure_container()
-    content = ContentSettings(content_type="application/pdf")
-    bc = _svc().get_blob_client(CONTAINER, blob_path)
-    try:
-        bc.upload_blob(pdf_bytes, overwrite=True, content_settings=content)
-        return CONTAINER, blob_path
-    except ClientAuthenticationError as e:
-        raise RuntimeError(f"[auth] 인증 실패: {e}")
-    except HttpResponseError as e:
-        raise RuntimeError(f"[http] 업로드 실패: {e}")
-    except Exception as e:
-        raise RuntimeError(f"[blob] 업로드 실패: {e}\n{traceback.format_exc()}")
+
+    KST = timezone(timedelta(hours=9))
+    d = (kst_date or datetime.now(KST)).date().isoformat()  # YYYY-MM-DD
+    base_blob = f"news_pdf/{d}.docx"
+    blob_path = _next_version_name(CONTAINER, base_blob)
+
+    docx_bytes = generate_docx_bytes(
+        items,
+        title=f"뉴스 스크랩 리포트 — {d}",
+        query=query,
+        freshness="",
+        market="",
+        generated_at=datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST"),
+    )
+
+    content = ContentSettings(
+        content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    _svc().get_blob_client(CONTAINER, blob_path).upload_blob(
+        docx_bytes, overwrite=False, content_settings=content
+    )
+
+    link = sas_url(CONTAINER, blob_path, minutes=120) or public_blob_url(
+        CONTAINER, blob_path
+    )
+    return CONTAINER, blob_path, link
 
 
+# ── 임의 DOCX 업로드 (이름 지정) ─────────────────────────────────
 def upload_docx(docx_bytes: bytes, blob_path: str) -> Tuple[str, str]:
-    """
-    이미 생성된 DOCX 바이트를 지정한 blob_path에 업로드.
-    blob_path 예: 'docx/KT_20251030.docx'
-    """
     ensure_container()
     content = ContentSettings(
         content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -432,20 +442,6 @@ def upload_docx(docx_bytes: bytes, blob_path: str) -> Tuple[str, str]:
         raise RuntimeError(f"[http] 업로드 실패: {e}")
     except Exception as e:
         raise RuntimeError(f"[blob] 업로드 실패: {e}\n{traceback.format_exc()}")
-
-
-def make_docx_filename_from_query(query: str, include_date: bool = True) -> str:
-    """
-    검색조건(쿼리)로부터 DOCX 파일명 생성. 'docx/' 아래에 저장.
-    """
-    q = (query or "").strip()
-    if not q:
-        q = "pressm"
-    slug = re.sub(r"[^0-9A-Za-z가-힣]+", "_", q).strip("_")
-    if include_date:
-        today = datetime.datetime.now().strftime("%Y%m%d")
-        return f"docx/{slug}_{today}.docx"
-    return f"docx/{slug}.docx"
 
 
 # ── CSV 변환 ─────────────────────────────────────────────────────
