@@ -185,3 +185,5 @@ Pressm AI는 언론홍보 업무를 도와주는 **AI 홍보 비서 시스템**
 - 향후 검색 가능한 RAG 인덱스(Azure AI Search) 구축
 
 ---
+
+### 시연 링크 : https://webpressm29881.azurewebsites.net/
